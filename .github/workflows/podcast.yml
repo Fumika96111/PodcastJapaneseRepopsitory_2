@@ -1,28 +1,33 @@
 name: Podcast Pipeline
+
 on:
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/30 * * * *"   # 30分ごとに実行
+  workflow_dispatch: {}       # 手動実行も許可
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-　　　- name: Run pipeline
-  　　　env:
-    　　　OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    　　　PROJECT_ID: podcast日本語訳
-    　　　RSS_URL: https://feeds.captivate.fm/bcg-imagine-this/
-  run: |
-    python main.py
+
+      - name: Run pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROJECT_ID: podcast日本語訳
+          RSS_URL: https://feeds.captivate.fm/bcg-imagine-this/
+        run: |
+          python main.py
 
       - name: Upload outputs
         if: always()
