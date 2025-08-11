@@ -1,0 +1,4 @@
+python-dotenv
+feedparser
+requests
+openai>=1.40.0
