@@ -5,18 +5,18 @@ import feedparser, requests
 from pathlib import Path
 
 # ====== Setup ======
-load_dotenv()                     # .env があれば読む（Actionsでは env: から渡す）
-client = OpenAI()                 # OPENAI_API_KEY は環境変数から
+load_dotenv()
+client = OpenAI()
 
 PROJECT_ID = os.getenv("PROJECT_ID", "podcast日本語訳")
 RSS_URL    = os.getenv("RSS_URL")
-
 OUT_DIR = Path("out"); OUT_DIR.mkdir(exist_ok=True)
 STATE_F = Path("state.json")
 
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 CHAT_MODEL       = os.getenv("CHAT_MODEL",       "gpt-4o-mini")
-CHUNK_SECONDS    = int(os.getenv("CHUNK_SECONDS", "1200"))   # 20分。モデル上限1400秒に余裕
+CHUNK_SECONDS    = int(os.getenv("CHUNK_SECONDS", "1200"))  # 20 minutes
+VECTOR_STORE_ID  = os.getenv("VECTOR_STORE_ID")  # optional: force a specific VS
 
 PROMPT = (
     "You are an expert EN->JA editor.\n"
@@ -35,18 +35,16 @@ PROMPT = (
 
 def log(*args): print(*args, file=sys.stderr)
 
-# ====== Guards ======
 def guard_env():
     ok = True
     if not os.getenv("OPENAI_API_KEY"):
-        log("ERROR: OPENAI_API_KEY is missing in Secrets/env.")
+        log("ERROR: OPENAI_API_KEY is missing.")
         ok = False
     if not RSS_URL:
-        log("ERROR: RSS_URL is missing. Set it in workflow env or .env.")
+        log("ERROR: RSS_URL is missing.")
         ok = False
     return ok
 
-# ====== State ======
 def load_state():
     if STATE_F.exists():
         return json.loads(STATE_F.read_text())
@@ -54,6 +52,28 @@ def load_state():
 
 def save_state(st):
     STATE_F.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+
+# ====== Vector Store (reuse) ======
+def get_or_create_vector_store(project_id):
+    global VECTOR_STORE_ID
+    st = load_state()
+    VECTOR_STORE_ID = VECTOR_STORE_ID or st.get("vector_store_id")
+    if VECTOR_STORE_ID:
+        return VECTOR_STORE_ID
+    vs = client.vector_stores.create(name=project_id)
+    VECTOR_STORE_ID = vs.id
+    st["vector_store_id"] = vs.id
+    save_state(st)
+    return vs.id
+
+def upload_to_vector_store(files, project_id):
+    vs_id = get_or_create_vector_store(project_id)
+    uploaded = []
+    for p in files:
+        f = client.files.create(purpose="assistants", file=p)
+        client.vector_stores.files.create(vector_store_id=vs_id, file_id=f.id)
+        uploaded.append(f.id)
+    return vs_id, uploaded
 
 # ====== RSS ======
 def fetch_new_episodes(rss_url, done_ids):
@@ -87,18 +107,16 @@ def download_audio(url, dest):
                     f.write(chunk)
     return dest
 
-# ====== Split (ffmpeg/ffprobe 必須) ======
-def split_audio_ffmpeg(src_path: str, chunk_seconds: int = CHUNK_SECONDS) -> list[Path]:
-    """
-    MP3/M4A を chunk_seconds ごとに無劣化分割。ffmpeg/ffprobe が必要。
-    """
+# ====== Split (ffmpeg) ======
+def split_audio_ffmpeg(src_path: str, chunk_seconds: int = CHUNK_SECONDS):
     src = Path(src_path)
-    # 総再生時間
+    # total duration
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(src)],
         capture_output=True, text=True, check=True
     )
     duration = float(json.loads(probe.stdout)["format"]["duration"])
+    import math
     parts = []
     n = math.ceil(duration / chunk_seconds)
     for i in range(n):
@@ -113,10 +131,6 @@ def split_audio_ffmpeg(src_path: str, chunk_seconds: int = CHUNK_SECONDS) -> lis
 
 # ====== OpenAI Calls ======
 def transcribe(audio_path, retries=3, backoff=5):
-    """
-    OpenAI Audio Transcriptions (gpt-4o-mini-transcribeなど)。
-    RateLimitや一時エラー時はリトライ。
-    """
     for attempt in range(1, retries+1):
         try:
             with open(audio_path, "rb") as f:
@@ -146,19 +160,6 @@ def postprocess_with_gpt(transcript_text, retries=3, backoff=5):
             log(f"[WARN] chat retry {attempt}/{retries} after error: {e}")
             time.sleep(backoff * attempt)
 
-def upload_to_vector_store(files, project_id):
-    """
-    毎回新規にVector Storeを作る簡易版。
-    既存に追加したい場合は、作成済みIDを保持して再利用する実装に変更してください。
-    """
-    vs = client.vector_stores.create(name=project_id)
-    uploaded = []
-    for p in files:
-        f = client.files.create(purpose="assistants", file=p)
-        client.vector_stores.files.create(vector_store_id=vs.id, file_id=f.id)
-        uploaded.append(f.id)
-    return vs.id, uploaded
-
 # ====== Main ======
 def run_once():
     if not guard_env():
@@ -184,7 +185,6 @@ def run_once():
         log(f"[DL] {it['title']}")
         download_audio(it["url"], audio_path)
 
-        # --- 長尺対応：20分ごとに分割して順次転写 ---
         log("[STT] splitting for model max duration…")
         parts = split_audio_ffmpeg(str(audio_path), chunk_seconds=CHUNK_SECONDS)
         log(f"[STT] transcribing {len(parts)} part(s)…")
@@ -198,12 +198,10 @@ def run_once():
         en_text = "\n\n".join(texts)
         txt_path.write_text(en_text, encoding="utf-8")
 
-        # --- 後処理：日本語要約/翻訳/イディオム抽出 ---
         log("[GPT] post-processing…")
         ja_report = postprocess_with_gpt(en_text)
         rep_path.write_text(ja_report, encoding="utf-8")
 
-        # --- Vector Store へ格納 ---
         log("[STORE] uploading to vector store…")
         vs_id, file_ids = upload_to_vector_store([txt_path, rep_path], PROJECT_ID)
         log(f"Done: {it['title']}  VS={vs_id}  files={file_ids}")
@@ -213,3 +211,4 @@ def run_once():
 
 if __name__ == "__main__":
     run_once()
+
