@@ -2,19 +2,21 @@ name: Podcast Pipeline
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30分ごとに実行
-  workflow_dispatch: {}       # 手動実行も許可
+    - cron: "*/30 * * * *"   # 30分ごと
+  workflow_dispatch: {}       # 手動実行
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install deps
         run: |
@@ -26,6 +28,10 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           PROJECT_ID: podcast日本語訳
           RSS_URL: https://feeds.captivate.fm/bcg-imagine-this/
+          # Optional tuning:
+          # TRANSCRIBE_MODEL: gpt-4o-mini-transcribe
+          # CHAT_MODEL: gpt-4o-mini
+          # CHUNK_SECONDS: "1200"   # 20分。必要なら変更
         run: |
           python main.py
 
