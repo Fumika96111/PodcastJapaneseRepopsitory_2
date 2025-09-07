@@ -1,7 +1,6 @@
 name: Podcast Pipeline
 on:
-  schedule:
-    - cron: "*/30 * * * *"
+  schedule:TBD
   workflow_dispatch: {}
 
 jobs:
